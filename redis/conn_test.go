@@ -16,6 +16,7 @@ package redis_test
 
 import (
 	"bytes"
+	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"fmt"
@@ -28,7 +29,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/garyburd/redigo/redis"
+	"github.com/gomodule/redigo/redis"
+	"github.com/stretchr/testify/require"
 )
 
 type testConn struct {
@@ -38,10 +40,14 @@ type testConn struct {
 	writeDeadline time.Time
 }
 
-func (*testConn) Close() error                         { return nil }
-func (*testConn) LocalAddr() net.Addr                  { return nil }
-func (*testConn) RemoteAddr() net.Addr                 { return nil }
-func (c *testConn) SetDeadline(t time.Time) error      { c.readDeadline = t; c.writeDeadline = t; return nil }
+func (*testConn) Close() error         { return nil }
+func (*testConn) LocalAddr() net.Addr  { return nil }
+func (*testConn) RemoteAddr() net.Addr { return nil }
+func (c *testConn) SetDeadline(t time.Time) error {
+	c.readDeadline = t
+	c.writeDeadline = t
+	return nil
+}
 func (c *testConn) SetReadDeadline(t time.Time) error  { c.readDeadline = t; return nil }
 func (c *testConn) SetWriteDeadline(t time.Time) error { c.writeDeadline = t; return nil }
 
@@ -66,10 +72,10 @@ func dialTestConnTLS(r string, w io.Writer) redis.DialOption {
 	return redis.DialNetDial(func(network, addr string) (net.Conn, error) {
 		client, server := net.Pipe()
 		tlsServer := tls.Server(server, &serverTLSConfig)
-		go io.Copy(tlsServer, strings.NewReader(r))
+		go io.Copy(tlsServer, strings.NewReader(r)) // nolint: errcheck
 		done := make(chan struct{})
 		go func() {
-			io.Copy(w, tlsServer)
+			io.Copy(w, tlsServer) // nolint: errcheck
 			close(done)
 		}()
 		return &tlsTestConn{Conn: client, done: done}, nil
@@ -170,6 +176,10 @@ var readTests = []struct {
 		"PONG",
 	},
 	{
+		"+OK\n\n", // no \r
+		errorSentinel,
+	},
+	{
 		"@OK\r\n",
 		errorSentinel,
 	},
@@ -207,6 +217,11 @@ var readTests = []struct {
 	},
 
 	{
+		// "" is not a valid length
+		"$\r\nfoobar\r\n",
+		errorSentinel,
+	},
+	{
 		// "x" is not a valid length
 		"$x\r\nfoobar\r\n",
 		errorSentinel,
@@ -214,6 +229,11 @@ var readTests = []struct {
 	{
 		// -2 is not a valid length
 		"$-2\r\n",
+		errorSentinel,
+	},
+	{
+		// ""  is not a valid integer
+		":\r\n",
 		errorSentinel,
 	},
 	{
@@ -253,6 +273,30 @@ func TestRead(t *testing.T) {
 			}
 			if !reflect.DeepEqual(actual, tt.expected) {
 				t.Errorf("Receive(%q) = %v, want %v", tt.reply, actual, tt.expected)
+			}
+		}
+	}
+}
+
+func TestReadString(t *testing.T) {
+	// n is value of bufio.defaultBufSize
+	const n = 4096
+
+	// Test read string lengths near bufio.Reader buffer boundaries.
+	testRanges := [][2]int{{0, 64}, {n - 64, n + 64}, {2*n - 64, 2*n + 64}}
+
+	p := make([]byte, 2*n+64)
+	for i := range p {
+		p[i] = byte('a' + i%26)
+	}
+	s := string(p)
+
+	for _, r := range testRanges {
+		for i := r[0]; i < r[1]; i++ {
+			c, _ := redis.Dial("", "", dialTestConn("+"+s[:i]+"\r\n", nil))
+			actual, err := c.Receive()
+			if err != nil || actual != s[:i] {
+				t.Fatalf("Receive(string len %d) -> err=%v, equal=%v", i, err, actual != s[:i])
 			}
 		}
 	}
@@ -364,7 +408,7 @@ func TestPipelineCommands(t *testing.T) {
 	}
 }
 
-func TestBlankCommmand(t *testing.T) {
+func TestBlankCommand(t *testing.T) {
 	c, err := redis.DialDefaultServer()
 	if err != nil {
 		t.Fatalf("error connection to database, %v", err)
@@ -399,12 +443,12 @@ func TestRecvBeforeSend(t *testing.T) {
 	defer c.Close()
 	done := make(chan struct{})
 	go func() {
-		c.Receive()
+		c.Receive() // nolint: errcheck
 		close(done)
 	}()
 	time.Sleep(time.Millisecond)
-	c.Send("PING")
-	c.Flush()
+	require.NoError(t, c.Send("PING"))
+	require.NoError(t, c.Flush())
 	<-done
 	_, err = c.Do("")
 	if err != nil {
@@ -419,7 +463,8 @@ func TestError(t *testing.T) {
 	}
 	defer c.Close()
 
-	c.Do("SET", "key", "val")
+	_, err = c.Do("SET", "key", "val")
+	require.NoError(t, err)
 	_, err = c.Do("HSET", "key", "fld", "val")
 	if err == nil {
 		t.Errorf("Expected err for HSET on string key.")
@@ -448,7 +493,8 @@ func TestReadTimeout(t *testing.T) {
 			}
 			go func() {
 				time.Sleep(time.Second)
-				c.Write([]byte("+OK\r\n"))
+				_, err := c.Write([]byte("+OK\r\n"))
+				require.NoError(t, err)
 				c.Close()
 			}()
 		}
@@ -478,14 +524,45 @@ func TestReadTimeout(t *testing.T) {
 	}
 	defer c2.Close()
 
-	c2.Send("PING")
-	c2.Flush()
+	require.NoError(t, c2.Send("PING"))
+	require.NoError(t, c2.Flush())
 	_, err = c2.Receive()
 	if err == nil {
 		t.Fatalf("c2.Receive() returned nil, expect error")
 	}
 	if c2.Err() == nil {
 		t.Fatalf("c2.Err() = nil, expect error")
+	}
+}
+
+func TestDialContextFunc(t *testing.T) {
+	var isPassed bool
+	f := func(ctx context.Context, network, addr string) (net.Conn, error) {
+		isPassed = true
+		return &testConn{}, nil
+	}
+
+	_, err := redis.DialContext(context.Background(), "", "", redis.DialContextFunc(f))
+	if err != nil {
+		t.Fatalf("DialContext returned %v", err)
+	}
+
+	if !isPassed {
+		t.Fatal("DialContextFunc not passed")
+	}
+}
+
+func TestDialContext_CanceledContext(t *testing.T) {
+	addr, err := redis.DefaultServerAddr()
+	if err != nil {
+		t.Fatalf("redis.DefaultServerAddr returned %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	if _, err = redis.DialContext(ctx, "tcp", addr); err == nil {
+		t.Fatalf("DialContext returned nil, expect error")
 	}
 }
 
@@ -514,6 +591,10 @@ var dialErrors = []struct {
 	{
 		"redis://localhost:6379/abc123",
 		"invalid database: abc123",
+	},
+	{
+		"redis:foo//localhost:6379",
+		"invalid redis URL, url is opaque: redis:foo//localhost:6379",
 	},
 }
 
@@ -558,7 +639,9 @@ var dialURLTests = []struct {
 	r           string
 	w           string
 }{
-	{"password", "redis://x:abc123@localhost", "+OK\r\n", "*2\r\n$4\r\nAUTH\r\n$6\r\nabc123\r\n"},
+	{"password", "redis://:abc123@localhost", "+OK\r\n", "*2\r\n$4\r\nAUTH\r\n$6\r\nabc123\r\n"},
+	{"username and password", "redis://user:password@localhost", "+OK\r\n", "*3\r\n$4\r\nAUTH\r\n$4\r\nuser\r\n$8\r\npassword\r\n"},
+	{"username", "redis://x:@localhost", "+OK\r\n", ""},
 	{"database 3", "redis://localhost/3", "+OK\r\n", "*2\r\n$6\r\nSELECT\r\n$1\r\n3\r\n"},
 	{"database 99", "redis://localhost/99", "+OK\r\n", "*2\r\n$6\r\nSELECT\r\n$2\r\n99\r\n"},
 	{"no database", "redis://localhost/", "+OK\r\n", ""},
@@ -621,6 +704,45 @@ func TestDialUseTLS(t *testing.T) {
 	checkPingPong(t, &buf, c)
 }
 
+type blockedReader struct {
+	ch chan struct{}
+}
+
+func (b blockedReader) Read(p []byte) (n int, err error) {
+	<-b.ch
+	return 0, nil
+}
+
+func dialTestBlockedConn(ch chan struct{}, w io.Writer) redis.DialOption {
+	return redis.DialNetDial(func(network, addr string) (net.Conn, error) {
+		return &testConn{Reader: blockedReader{ch: ch}, Writer: w}, nil
+	})
+}
+
+func TestDialTLSHandshakeTimeout(t *testing.T) {
+	var buf bytes.Buffer
+	ch := make(chan struct{})
+	var err error
+	go func() {
+		_, err = redis.Dial("tcp", "example.com:6379",
+			redis.DialTLSConfig(&clientTLSConfig),
+			redis.DialTLSHandshakeTimeout(time.Millisecond),
+			dialTestBlockedConn(ch, &buf),
+			redis.DialUseTLS(true))
+		close(ch)
+	}()
+	select {
+	case <-time.After(time.Second):
+		t.Fatal("dial didn't timeout")
+	case <-ch:
+		if err == nil {
+			t.Fatal("dial didn't error")
+		} else if err.Error() != "TLS handshake timeout" {
+			t.Fatal("dial unexpected error:", err)
+		}
+	}
+}
+
 func TestDialTLSSKipVerify(t *testing.T) {
 	var buf bytes.Buffer
 	c, err := redis.Dial("tcp", "example.com:6379",
@@ -633,9 +755,86 @@ func TestDialTLSSKipVerify(t *testing.T) {
 	checkPingPong(t, &buf, c)
 }
 
+func TestDialUseACL(t *testing.T) {
+	var buf bytes.Buffer
+	_, err := redis.Dial("tcp", "localhost:6379",
+		redis.DialUsername("user"),
+		redis.DialPassword("password"),
+		dialTestConn(pingResponse, &buf))
+	if err != nil {
+		t.Fatal("dial error:", err)
+	}
+	if err != nil {
+		t.Fatal("dial error:", err)
+	}
+	expected := "*3\r\n$4\r\nAUTH\r\n$4\r\nuser\r\n$8\r\npassword\r\n"
+	if w := buf.String(); w != expected {
+		t.Errorf("got %q, want %q", w, expected)
+	}
+}
+
+// Connect to an Redis instance using the Redis ACL system
+func ExampleDial_acl() {
+	c, err := redis.Dial("tcp", "localhost:6379",
+		redis.DialUsername("username"),
+		redis.DialPassword("password"),
+	)
+	if err != nil {
+		// handle error
+	}
+	defer c.Close()
+}
+
+func TestDialClientName(t *testing.T) {
+	var buf bytes.Buffer
+	_, err := redis.Dial("tcp", ":6379",
+		dialTestConn(pingResponse, &buf),
+		redis.DialClientName("redis-connection"),
+	)
+	if err != nil {
+		t.Fatal("dial error:", err)
+	}
+	expected := "*3\r\n$6\r\nCLIENT\r\n$7\r\nSETNAME\r\n$16\r\nredis-connection\r\n"
+	if w := buf.String(); w != expected {
+		t.Errorf("got %q, want %q", w, expected)
+	}
+
+	// testing against a real server
+	connectionName := "test-connection"
+	c, err := redis.DialDefaultServer(redis.DialClientName(connectionName))
+	if err != nil {
+		t.Fatalf("error connection to database, %v", err)
+	}
+	defer c.Close()
+
+	v, err := c.Do("CLIENT", "GETNAME")
+	if err != nil {
+		t.Fatalf("CLIENT GETNAME returned error %v", err)
+	}
+
+	vs, err := redis.String(v, nil)
+	if err != nil {
+		t.Fatalf("String(v) returned error %v", err)
+	}
+
+	if vs != connectionName {
+		t.Fatalf("wrong connection name. Got '%s', expected '%s'", vs, connectionName)
+	}
+}
+
 // Connect to local instance of Redis running on the default port.
 func ExampleDial() {
 	c, err := redis.Dial("tcp", ":6379")
+	if err != nil {
+		// handle error
+	}
+	defer c.Close()
+}
+
+// Connect to local instance of Redis running on the default port using the provided context.
+func ExampleDialContext() {
+	ctx := context.Background()
+	c, err := redis.DialContext(ctx, "tcp", ":6379")
 	if err != nil {
 		// handle error
 	}
@@ -663,11 +862,13 @@ func TestExecError(t *testing.T) {
 
 	// Execute commands that fail before EXEC is called.
 
-	c.Do("DEL", "k0")
-	c.Do("ZADD", "k0", 0, 0)
-	c.Send("MULTI")
-	c.Send("NOTACOMMAND", "k0", 0, 0)
-	c.Send("ZINCRBY", "k0", 0, 0)
+	_, err = c.Do("DEL", "k0")
+	require.NoError(t, err)
+	_, err = c.Do("ZADD", "k0", 0, 0)
+	require.NoError(t, err)
+	require.NoError(t, c.Send("MULTI"))
+	require.NoError(t, c.Send("NOTACOMMAND", "k0", 0, 0))
+	require.NoError(t, c.Send("ZINCRBY", "k0", 0, 0))
 	v, err := c.Do("EXEC")
 	if err == nil {
 		t.Fatalf("EXEC returned values %v, expected error", v)
@@ -676,11 +877,13 @@ func TestExecError(t *testing.T) {
 	// Execute commands that fail after EXEC is called. The first command
 	// returns an error.
 
-	c.Do("DEL", "k1")
-	c.Do("ZADD", "k1", 0, 0)
-	c.Send("MULTI")
-	c.Send("HSET", "k1", 0, 0)
-	c.Send("ZINCRBY", "k1", 0, 0)
+	_, err = c.Do("DEL", "k1")
+	require.NoError(t, err)
+	_, err = c.Do("ZADD", "k1", 0, 0)
+	require.NoError(t, err)
+	require.NoError(t, c.Send("MULTI"))
+	require.NoError(t, c.Send("HSET", "k1", 0, 0))
+	require.NoError(t, c.Send("ZINCRBY", "k1", 0, 0))
 	v, err = c.Do("EXEC")
 	if err != nil {
 		t.Fatalf("EXEC returned error %v", err)
@@ -706,10 +909,11 @@ func TestExecError(t *testing.T) {
 	// Execute commands that fail after EXEC is called. The second command
 	// returns an error.
 
-	c.Do("ZADD", "k2", 0, 0)
-	c.Send("MULTI")
-	c.Send("ZINCRBY", "k2", 0, 0)
-	c.Send("HSET", "k2", 0, 0)
+	_, err = c.Do("ZADD", "k2", 0, 0)
+	require.NoError(t, err)
+	require.NoError(t, c.Send("MULTI"))
+	require.NoError(t, c.Send("ZINCRBY", "k2", 0, 0))
+	require.NoError(t, c.Send("HSET", "k2", 0, 0))
 	v, err = c.Do("EXEC")
 	if err != nil {
 		t.Fatalf("EXEC returned error %v", err)
@@ -834,15 +1038,17 @@ func TestWithTimeout(t *testing.T) {
 				var minDeadline, maxDeadline time.Time
 
 				// Alternate between default and specified timeout.
+				var err error
 				if i%2 == 0 {
 					if defaultTimout != 0 {
 						minDeadline = time.Now().Add(defaultTimout)
 					}
 					if recv {
-						c.Receive()
+						_, err = c.Receive()
 					} else {
-						c.Do("PING")
+						_, err = c.Do("PING")
 					}
+					require.NoError(t, err)
 					if defaultTimout != 0 {
 						maxDeadline = time.Now().Add(defaultTimout)
 					}
@@ -850,10 +1056,11 @@ func TestWithTimeout(t *testing.T) {
 					timeout := 10 * time.Minute
 					minDeadline = time.Now().Add(timeout)
 					if recv {
-						redis.ReceiveWithTimeout(c, timeout)
+						_, err = redis.ReceiveWithTimeout(c, timeout)
 					} else {
-						redis.DoWithTimeout(c, timeout, "PING")
+						_, err = redis.DoWithTimeout(c, timeout, "PING")
 					}
+					require.NoError(t, err)
 					maxDeadline = time.Now().Add(timeout)
 				}
 

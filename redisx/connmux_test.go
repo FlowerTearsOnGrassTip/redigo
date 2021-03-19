@@ -19,13 +19,13 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/garyburd/redigo/internal/redistest"
-	"github.com/garyburd/redigo/redis"
-	"github.com/garyburd/redigo/redisx"
+	"github.com/gomodule/redigo/redis"
+	"github.com/gomodule/redigo/redisx"
+	"github.com/stretchr/testify/require"
 )
 
 func TestConnMux(t *testing.T) {
-	c, err := redistest.Dial()
+	c, err := redisx.DialTest()
 	if err != nil {
 		t.Fatalf("error connection to database, %v", err)
 	}
@@ -34,8 +34,10 @@ func TestConnMux(t *testing.T) {
 
 	c1 := m.Get()
 	c2 := m.Get()
-	c1.Send("ECHO", "hello")
-	c2.Send("ECHO", "world")
+	err = c1.Send("ECHO", "hello")
+	require.NoError(t, err)
+	err = c2.Send("ECHO", "world")
+	require.NoError(t, err)
 	c1.Flush()
 	c2.Flush()
 	s, err := redis.String(c1.Receive())
@@ -57,7 +59,7 @@ func TestConnMux(t *testing.T) {
 }
 
 func TestConnMuxClose(t *testing.T) {
-	c, err := redistest.Dial()
+	c, err := redisx.DialTest()
 	if err != nil {
 		t.Fatalf("error connection to database, %v", err)
 	}
@@ -93,7 +95,7 @@ func TestConnMuxClose(t *testing.T) {
 
 func BenchmarkConn(b *testing.B) {
 	b.StopTimer()
-	c, err := redistest.Dial()
+	c, err := redisx.DialTest()
 	if err != nil {
 		b.Fatalf("error connection to database, %v", err)
 	}
@@ -109,7 +111,7 @@ func BenchmarkConn(b *testing.B) {
 
 func BenchmarkConnMux(b *testing.B) {
 	b.StopTimer()
-	c, err := redistest.Dial()
+	c, err := redisx.DialTest()
 	if err != nil {
 		b.Fatalf("error connection to database, %v", err)
 	}
@@ -130,7 +132,7 @@ func BenchmarkConnMux(b *testing.B) {
 func BenchmarkPool(b *testing.B) {
 	b.StopTimer()
 
-	p := redis.Pool{Dial: redistest.Dial, MaxIdle: 1}
+	p := redis.Pool{Dial: redisx.DialTest, MaxIdle: 1}
 	defer p.Close()
 
 	// Fill the pool.
@@ -155,7 +157,7 @@ const numConcurrent = 10
 
 func BenchmarkConnMuxConcurrent(b *testing.B) {
 	b.StopTimer()
-	c, err := redistest.Dial()
+	c, err := redisx.DialTest()
 	if err != nil {
 		b.Fatalf("error connection to database, %v", err)
 	}
@@ -173,9 +175,8 @@ func BenchmarkConnMuxConcurrent(b *testing.B) {
 			defer wg.Done()
 			for i := 0; i < b.N; i++ {
 				c := m.Get()
-				if _, err := c.Do("PING"); err != nil {
-					b.Fatal(err)
-				}
+				_, err := c.Do("PING")
+				require.NoError(b, err)
 				c.Close()
 			}
 		}()
@@ -186,7 +187,7 @@ func BenchmarkConnMuxConcurrent(b *testing.B) {
 func BenchmarkPoolConcurrent(b *testing.B) {
 	b.StopTimer()
 
-	p := redis.Pool{Dial: redistest.Dial, MaxIdle: numConcurrent}
+	p := redis.Pool{Dial: redisx.DialTest, MaxIdle: numConcurrent}
 	defer p.Close()
 
 	// Fill the pool.
@@ -212,9 +213,8 @@ func BenchmarkPoolConcurrent(b *testing.B) {
 			defer wg.Done()
 			for i := 0; i < b.N; i++ {
 				c := p.Get()
-				if _, err := c.Do("PING"); err != nil {
-					b.Fatal(err)
-				}
+				_, err := c.Do("PING")
+				require.NoError(b, err)
 				c.Close()
 			}
 		}()
@@ -224,7 +224,7 @@ func BenchmarkPoolConcurrent(b *testing.B) {
 
 func BenchmarkPipelineConcurrency(b *testing.B) {
 	b.StopTimer()
-	c, err := redistest.Dial()
+	c, err := redisx.DialTest()
 	if err != nil {
 		b.Fatalf("error connection to database, %v", err)
 	}
@@ -243,14 +243,13 @@ func BenchmarkPipelineConcurrency(b *testing.B) {
 			for i := 0; i < b.N; i++ {
 				id := pipeline.Next()
 				pipeline.StartRequest(id)
-				c.Send("PING")
+				err = c.Send("PING")
+				require.NoError(b, err)
 				c.Flush()
 				pipeline.EndRequest(id)
 				pipeline.StartResponse(id)
 				_, err := c.Receive()
-				if err != nil {
-					b.Fatal(err)
-				}
+				require.NoError(b, err)
 				pipeline.EndResponse(id)
 			}
 		}()
